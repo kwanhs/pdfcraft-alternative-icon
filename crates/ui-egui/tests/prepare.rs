@@ -7,8 +7,10 @@ use egui_kittest::kittest::Queryable;
 use pdfcraft_ui_egui::{PdfCraftApp, QuickTool};
 
 fn harness() -> Harness<'static, PdfCraftApp> {
-    let mut h = Harness::builder().with_size(egui::vec2(1400.0, 900.0)).build_eframe(|_cc| {
+    let mut h = Harness::builder().with_size(egui::vec2(1400.0, 900.0)).build_eframe(|cc| {
+        cc.egui_ctx.options_mut(|options| options.warn_on_id_clash = true);
         let mut app = PdfCraftApp::new();
+        app.set_option("language", "en").unwrap();
         app.open_bytes("form.pdf", None, include_bytes!("data/form.pdf").to_vec()).unwrap();
         app.set_option("zoom", "150").unwrap();
         app
@@ -156,6 +158,27 @@ fn appearance_tab_restyles_the_field() {
     h.get_by_label("Appearance").click();
     h.run_steps(2);
     h.get_by_label("Line Style:");
+    fn no_grid_id_warning(shape: &egui::Shape) -> bool {
+        match shape {
+            egui::Shape::Vec(shapes) => shapes.iter().all(no_grid_id_warning),
+            egui::Shape::Text(text) => !text.galley.job.text.contains("Grid ID"),
+            _ => true,
+        }
+    }
+    // Check egui's actual painted diagnostics, rather than reproducing the ID formula.
+    assert!(h.output().shapes.iter().all(|shape| no_grid_id_warning(&shape.shape)), "palette grids must not share an ID");
+    let before = h.state().field_props.as_ref().unwrap().look.unwrap();
+    assert_eq!(h.get_all_by_label("No color").count(), 2);
+    h.get_all_by_label("No color").next().unwrap().click();
+    h.run_steps(2);
+    let border = h.state().field_props.as_ref().unwrap().look.as_ref().unwrap().border;
+    assert_eq!(border, if before.border.is_some() { None } else { Some([0.0; 3]) });
+    assert_eq!(h.state().field_props.as_ref().unwrap().look.as_ref().unwrap().fill, before.fill);
+    h.get_all_by_label("No color").nth(1).unwrap().click();
+    h.run_steps(2);
+    let look = h.state().field_props.as_ref().unwrap().look.as_ref().unwrap();
+    assert_eq!(look.border, border);
+    assert_eq!(look.fill, if before.fill.is_some() { None } else { Some([0.0; 3]) });
     {
         let d = h.state_mut().field_props.as_mut().unwrap();
         let l = d.look.as_mut().expect("a look");
@@ -168,6 +191,39 @@ fn appearance_tab_restyles_the_field() {
     let s = h.state();
     let l = s.session.get(s.views[0].id).unwrap().field_look("city").unwrap();
     assert_eq!((l.style, l.font, l.fill), (BorderStyle::Dashed, FieldFont::Courier, Some([1.0, 1.0, 0.8])));
+}
+
+#[test]
+fn position_tab_rotates_a_field() {
+    let mut h = harness();
+    h.state_mut().open_field_props("city", 0);
+    h.run_steps(2);
+    let widget = |h: &Harness<'static, PdfCraftApp>| {
+        let s = h.state();
+        let f = s.session.get(s.views[0].id).unwrap().form.iter().find(|f| f.name == "city").unwrap();
+        f.widgets[0].clone()
+    };
+    let before = widget(&h);
+    assert_eq!(before.rotation, 0);
+    assert!(h.state().field_props.as_ref().unwrap().props().is_none(), "an unchanged draft is not an edit");
+    h.get_by_label("Position").click();
+    h.run_steps(2);
+    h.get_by_label("Rotation:");
+    h.state_mut().field_props.as_mut().unwrap().rotation = 90;
+    assert!(h.state().field_props.as_ref().unwrap().props().is_some());
+    h.get_by_label("OK").click();
+    h.run_steps(3);
+    let turned = widget(&h);
+    assert_eq!(turned.rotation, 90);
+    let [x0, y0, x1, y1] = before.rect;
+    let (cx, cy, w, ht) = ((x0 + x1) / 2.0, (y0 + y1) / 2.0, x1 - x0, y1 - y0);
+    let expect = [cx - ht / 2.0, cy - w / 2.0, cx + ht / 2.0, cy + w / 2.0];
+    assert!(turned.rect.iter().zip(expect).all(|(a, b)| (a - b).abs() < 0.05), "{:?} vs {expect:?}", turned.rect);
+    h.state_mut().execute("edit.undo");
+    h.run_steps(3);
+    let back = widget(&h);
+    assert_eq!(back.rotation, 0);
+    assert!(back.rect.iter().zip(before.rect).all(|(a, b)| (a - b).abs() < 0.05), "{:?} vs {:?}", back.rect, before.rect);
 }
 
 #[test]
@@ -192,6 +248,69 @@ fn options_tab_sets_the_check_box_style() {
     h.run_steps(3);
     let s = h.state();
     assert_eq!(s.session.get(s.views[0].id).unwrap().field_check_style("agree"), Some(CheckStyle::Cross));
+}
+
+#[test]
+fn dropdown_alignment_is_editable_and_preserved() {
+    choice_alignment(pdfcraft_engine::NewField::Combo { options: vec!["One".into(), "Two".into()], editable: false }, "Center", 1);
+}
+
+#[test]
+fn list_box_alignment_is_editable_and_preserved() {
+    choice_alignment(pdfcraft_engine::NewField::List { options: vec!["One".into(), "Two".into()], multi: true }, "Left", 0);
+}
+
+fn choice_alignment(kind: pdfcraft_engine::NewField, label: &str, quadding: i64) {
+    use pdfcraft_engine::{Edit, FieldProps, FieldValue};
+    let mut h = harness();
+    h.state_mut().apply_edit(Edit::AddField { page: 0, rect: [40.0, 260.0, 240.0, 310.0], kind, name: Some("aligned_choice".into()) });
+    h.state_mut()
+        .apply_edit(Edit::SetFieldProps { name: "aligned_choice".into(), props: Box::new(FieldProps { quadding: Some(2), ..Default::default() }) });
+    h.state_mut().apply_edit(Edit::SetFieldValue { name: "aligned_choice".into(), value: FieldValue::Choice(vec!["Two".into()]) });
+    let field = |h: &Harness<'static, PdfCraftApp>| {
+        let app = h.state();
+        app.session.get(app.views[0].id).unwrap().form.iter().find(|f| f.name == "aligned_choice").unwrap().clone()
+    };
+    let original = field(&h);
+    h.state_mut().open_field_props("aligned_choice", 0);
+    h.run_steps(2);
+    h.get_by_label("Options").click();
+    h.run_steps(2);
+    h.get_by_label("Alignment:");
+    // The imported right alignment is displayed and unchanged until a choice is made.
+    h.get_by_value("Right").click();
+    h.run_steps(2);
+    h.get_by_label(label).click();
+    h.run_steps(2);
+    h.get_by_label("Cancel").click();
+    h.run_steps(2);
+    assert_eq!(field(&h).quadding, 2, "cancel keeps the existing /Q");
+    h.state_mut().open_field_props("aligned_choice", 0);
+    h.run_steps(2);
+    h.get_by_label("Options").click();
+    h.run_steps(2);
+    h.get_by_value("Right").click();
+    h.run_steps(2);
+    h.get_by_label(label).click();
+    h.run_steps(2);
+    h.get_by_label("OK").click();
+    h.run_steps(3);
+    let changed = field(&h);
+    assert_eq!(changed.quadding, quadding);
+    assert_eq!((changed.options, changed.value, changed.flags), (original.options, original.value, original.flags));
+    let app = h.state();
+    let id = app.views[0].id;
+    assert_eq!(app.session.get(id).unwrap().can_undo(), Some("Change field properties"));
+    let bytes = app.session.save_bytes(id).unwrap();
+    let mut reopened = pdfcraft_engine::Session::new();
+    let reopened_id = reopened.open("saved.pdf", None, bytes, None).unwrap();
+    assert_eq!(reopened.get(reopened_id).unwrap().form.iter().find(|f| f.name == "aligned_choice").unwrap().quadding, quadding);
+    h.state_mut().execute("edit.undo");
+    h.run_steps(3);
+    assert_eq!(field(&h).quadding, 2);
+    h.state_mut().execute("edit.redo");
+    h.run_steps(3);
+    assert_eq!(field(&h).quadding, quadding);
 }
 
 #[test]
